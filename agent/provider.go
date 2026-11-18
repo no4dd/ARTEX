@@ -483,6 +483,9 @@ func (t planTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		body["access_programs"] = map[string]string{"cyber": t.cyber}
 	}
 	if raw, ok := body["tools"].([]any); ok && len(raw) > 0 {
+		for _, item := range raw {
+			planSingleFactTool(item)
+		}
 		body["tools"] = []any{map[string]any{"type": "namespace", "name": "artex", "description": "ARTEX local security testing tools", "tools": raw}}
 	}
 	if input, ok := body["input"].([]any); ok {
@@ -506,6 +509,38 @@ func (t planTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	cloned.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
 	cloned.Header.Set("Authorization", "Bearer "+token)
 	return t.base.RoundTrip(cloned)
+}
+
+// Strict plan tools cannot express record_fact's optional single/batch union:
+// Norma makes every root property required, so batch calls also carry the
+// single-fact fields that the handler rejects. Expose only single-fact input
+// on this route while leaving the handler and other providers unchanged.
+func planSingleFactTool(item any) {
+	tool, ok := item.(map[string]any)
+	if !ok || tool["name"] != "record_fact" {
+		return
+	}
+	if description, ok := tool["description"].(string); ok {
+		tool["description"] = description + "\nFor this ChatGPT plan route, call record_fact with one fact in the top-level fields. Do not use a facts array."
+	}
+	params, ok := tool["parameters"].(map[string]any)
+	if !ok {
+		return
+	}
+	props, ok := params["properties"].(map[string]any)
+	if !ok {
+		return
+	}
+	delete(props, "facts")
+	if required, ok := params["required"].([]any); ok {
+		filtered := required[:0]
+		for _, name := range required {
+			if name != "facts" {
+				filtered = append(filtered, name)
+			}
+		}
+		params["required"] = filtered
+	}
 }
 
 type planProvider struct{ llm.Provider }
