@@ -24,8 +24,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=build /out/artex /app/artex
 COPY start.sh /app/start.sh
+COPY start-plan-local.sh /app/start-plan-local.sh
+COPY scripts/plan_target_forward.py /app/scripts/plan_target_forward.py
 COPY skills/ /app/skills/
-RUN chmod 0755 /app/artex /app/start.sh && mkdir -p /app/data /app/keys
+RUN chmod 0755 /app/artex /app/start.sh /app/start-plan-local.sh && mkdir -p /app/data /app/keys
 EXPOSE 8787 8788
-ENTRYPOINT ["/app/start.sh"]
+ENTRYPOINT ["/app/start-plan-local.sh"]
 CMD ["-addr", ":8787", "-proxy", ":8788"]

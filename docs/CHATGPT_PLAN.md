@@ -30,7 +30,7 @@ The rest of ARTEX retains its normal capabilities: agents can run shell tools an
 
 Start with a staging environment or test account. Enable ARTEX's target gate, use an exact target origin, set `ARTEX_NOISE_PROFILE=quiet`, and set task/intent budgets before starting autonomous work. Bash-launched scanner traffic is not covered by the noise governor, so run a narrowly scoped first task and inspect its command log. Avoid broad network or production data access.
 
-The app at `http://127.0.0.1:3000` is on the Mac host. A Docker container's own `127.0.0.1` is the container, so ARTEX will need a deliberately scoped host-to-container forwarding path before its workers can reach that app. Do not change the app's WorkOS callback address to make the container reach it. The ChatGPT connection and model test can be completed before any target forwarding is set up.
+The app at `http://127.0.0.1:3000` is on the Mac host. A Docker container's own `127.0.0.1` is the container. The smaller local image runs a fixed forwarder on its own `127.0.0.1:3000` that connects only to `host.docker.internal:3000` and sends `Host: 127.0.0.1:3000`, which BlankSuite's local authority profile expects. It does not expose an extra host port. Do not change BlankSuite's WorkOS callback address. The ChatGPT connection and model test can be completed before creating any target task.
 
 ## Verification and current limits
 
