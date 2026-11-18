@@ -328,6 +328,16 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		if c.Model == "" {
 			c.Model = "gpt-5"
 		}
+	case "chatgpt-plan":
+		// The plan endpoint and credential are fixed by the signed-in account.
+		// Never inherit user input or environment keys in this config path.
+		c.Format = FormatChatGPTPlan
+		c.BaseURL = "https://api.openai.com/v1"
+		c.APIKey = ""
+		c.Proxy = ""
+		if c.Model == "" {
+			c.Model = "gpt-6-sol"
+		}
 	case "ollama":
 		c.Format = FormatOllama
 		// Ollama's OpenAI-compatible endpoint lives at /v1 and the provider
