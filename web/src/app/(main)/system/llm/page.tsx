@@ -56,11 +56,12 @@ const MAX_TOKENS_FIELD_HINTS: Record<string, string> = {
     "Which key carries the cap. max_tokens is the default and the vast majority of compatible gateways only accept it; OpenAI's official reasoning models (the o series / GPT-5) conversely only accept max_completion_tokens and fail outright with unsupported_parameter when they receive max_tokens.",
   anthropic: "Only selectable for the openai format. Anthropic's field name is fixed as max_tokens.",
   "openai-responses": "Only selectable for the openai format. The Responses API's field name is fixed as max_output_tokens.",
+  "chatgpt-plan": "ChatGPT plan usage does not support an output cap in this flow.",
   ollama: "Only selectable for the openai format. Ollama's field name is fixed as max_tokens.",
 };
 // LLM profile formats. The default in the create form is "anthropic"; "ollama" is the
 // keyless local-server format (base URL defaults to http://127.0.0.1:11434/v1).
-type ProfileFormat = "anthropic" | "openai" | "openai-responses" | "ollama";
+type ProfileFormat = "anthropic" | "openai" | "openai-responses" | "ollama" | "chatgpt-plan";
 const OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1";
 const EFFORT_LEVELS: { value: string; label: string }[] = [
   { value: NONE, label: "Not sent (default)" },
@@ -81,8 +82,11 @@ function cooldownText(secs: number) {
 // the exception is Ollama, a keyless local server that IS callable without a key. The other states come from the pool's breaker
 // records (with polling off no new records appear, so "healthy" = no known failure).
 type Health = { label: string; cls: string; hint?: string };
-function healthOf(p: LLMProfile, m?: LLMPoolMember): Health {
-  if (!p.api_key_hint && p.format !== "ollama") {
+function healthOf(p: LLMProfile, m?: LLMPoolMember, planConnected = false): Health {
+  if (p.format === "chatgpt-plan" && !planConnected) {
+    return { label: "Sign in needed", cls: "border-muted-foreground/40 text-muted-foreground" };
+  }
+  if (!p.api_key_hint && p.format !== "ollama" && p.format !== "chatgpt-plan") {
     return {
       label: "No Key configured",
       cls: "border-muted-foreground/40 text-muted-foreground",
@@ -351,7 +355,7 @@ function ProfileSheet({
     if (!open) return;
     setName(profile?.name ?? "");
     setFormat(
-      profile?.format === "openai" || profile?.format === "openai-responses" || profile?.format === "ollama"
+      profile?.format === "openai" || profile?.format === "openai-responses" || profile?.format === "ollama" || profile?.format === "chatgpt-plan"
         ? profile.format
         : "anthropic",
     );
@@ -394,7 +398,7 @@ function ProfileSheet({
     setModels([]);
     setModelQuery("");
     try {
-      const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
+      const r = await api.fetchLLMModels(format, format === "chatgpt-plan" ? "" : baseUrl, format === "chatgpt-plan" ? "" : apiKey, format === "chatgpt-plan" ? "" : proxy, profileId);
       if (r.ok && r.models && r.models.length > 0) {
         setModels(r.models);
         setModelsOpen(true);
@@ -418,13 +422,13 @@ function ProfileSheet({
       const r = await api.testLLM(
         format,
         model,
-        baseUrl,
-        apiKey,
-        proxy,
+        format === "chatgpt-plan" ? "" : baseUrl,
+        format === "chatgpt-plan" ? "" : apiKey,
+        format === "chatgpt-plan" ? "" : proxy,
         toStore(thinkingType),
         toStore(effort),
         profileId,
-        streaming,
+        format === "chatgpt-plan" ? true : streaming,
         sessionHeaderKey.trim(),
         userAgent.trim(),
       );
@@ -454,9 +458,9 @@ function ProfileSheet({
         name: name.trim(),
         format,
         model: model.trim(),
-        base_url: baseUrl.trim(),
-        proxy: proxy.trim(),
-        api_key: apiKey,
+        base_url: format === "chatgpt-plan" ? "" : baseUrl.trim(),
+        proxy: format === "chatgpt-plan" ? "" : proxy.trim(),
+        api_key: format === "chatgpt-plan" ? "" : apiKey,
         rate_per_second: Number(rps) || 0,
         rate_per_minute: Number(rpm) || 0,
         context_window_k: Number(cw) || 0,
@@ -464,8 +468,8 @@ function ProfileSheet({
         reasoning_effort: toStore(effort),
         priority: Number(priority) || 0,
         pool_exclude: poolExclude,
-        streaming,
-        max_tokens: Math.max(0, Number(maxTokens) || 0),
+        streaming: format === "chatgpt-plan" ? true : streaming,
+        max_tokens: format === "chatgpt-plan" ? 0 : Math.max(0, Number(maxTokens) || 0),
         // The field-name switch only matters for openai (Chat Completions); every other format falls back to the default,
         // and the backend re-applies the same normalization; this just keeps the UI from sending contradictory values.
         max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
@@ -487,6 +491,8 @@ function ProfileSheet({
   let keyPlaceholder = "sk-…";
   if (format === "ollama") {
     keyPlaceholder = "optional — a local Ollama server runs keyless";
+  } else if (format === "chatgpt-plan") {
+    keyPlaceholder = "Use Continue with ChatGPT above";
   } else if (keyHint) {
     keyPlaceholder = `Set (${keyHint}); leave empty to keep it`;
   }
@@ -534,6 +540,7 @@ function ProfileSheet({
                   <SelectItem value="anthropic">Anthropic</SelectItem>
                   <SelectItem value="openai">OpenAI (Chat Completions)</SelectItem>
                   <SelectItem value="openai-responses">OpenAI (Responses API)</SelectItem>
+                  <SelectItem value="chatgpt-plan">ChatGPT plan (sign in)</SelectItem>
                   <SelectItem value="ollama">Ollama (local, no key needed)</SelectItem>
                 </SelectContent>
               </Select>
@@ -546,7 +553,7 @@ function ProfileSheet({
               <Input
                 id="p-model"
                 className="font-mono"
-                placeholder={format === "ollama" ? "llama3.2" : "claude-opus-4-8"}
+                placeholder={format === "ollama" ? "llama3.2" : format === "chatgpt-plan" ? "gpt-6-sol" : "claude-opus-4-8"}
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
               />
@@ -621,6 +628,7 @@ function ProfileSheet({
               placeholder={format === "ollama" ? OLLAMA_DEFAULT_BASE_URL : "https://api.openai.com/v1"}
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
+              disabled={format === "chatgpt-plan"}
             />
           </div>
 
@@ -632,6 +640,7 @@ function ProfileSheet({
               placeholder="socks5://user:pass@127.0.0.1:1080 · http://127.0.0.1:8080"
               value={proxy}
               onChange={(e) => setProxy(e.target.value)}
+              disabled={format === "chatgpt-plan"}
             />
             <p className="text-muted-foreground text-xs">
               Only outbound LLM requests go through this proxy; http/https/socks5 are supported, optionally with credentials (e.g.
@@ -670,7 +679,7 @@ function ProfileSheet({
             </p>
           </div>
 
-          <div className="grid gap-2">
+          {format !== "chatgpt-plan" && <div className="grid gap-2">
             <Label htmlFor="p-api-key">
               {format === "ollama" ? "API Key (optional for Ollama)" : "API Key"}
             </Label>
@@ -688,7 +697,7 @@ function ProfileSheet({
               data-1p-ignore="true"
               data-lpignore="true"
             />
-          </div>
+          </div>}
 
           <div className="grid gap-4 sm:grid-cols-3">
             <div className="grid gap-2">
@@ -754,7 +763,7 @@ function ProfileSheet({
                   at the cost of losing live in-flight progress.
                 </p>
               </div>
-              <Switch checked={streaming} onCheckedChange={setStreaming} aria-label="Streaming output" />
+              <Switch checked={format === "chatgpt-plan" || streaming} onCheckedChange={setStreaming} disabled={format === "chatgpt-plan"} aria-label="Streaming output" />
             </div>
           </div>
 
@@ -778,6 +787,7 @@ function ProfileSheet({
                 value={maxTokens}
                 onChange={(e) => setMaxTokens(e.target.value)}
                 placeholder="0"
+                disabled={format === "chatgpt-plan"}
               />
             </div>
             <div className="flex items-center justify-between gap-4 border-t pt-3">
@@ -872,6 +882,8 @@ function ProfileSheet({
 
 export default function LLMPage() {
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
+  const [planStatus, setPlanStatus] = React.useState<{ connected: boolean; cyber_program: string; accounts: { client_id: string; email: string; active: boolean; connected: boolean }[] }>({ connected: false, cyber_program: "", accounts: [] });
+  const [planBusy, setPlanBusy] = React.useState(false);
   const [pool, setPool] = React.useState<LLMPoolStatus | null>(null);
   const [poolOpen, setPoolOpen] = React.useState(false);
   // The drawer's open flag and its content are stored separately: editing stays put on close, otherwise during the closing animation the title would flash
@@ -890,6 +902,48 @@ export default function LLMPage() {
       /* ignore */
     }
   }, []);
+
+  const loadPlan = React.useCallback(async () => {
+    try { setPlanStatus(await api.chatGPTPlanStatus()); } catch { /* leave the last known state */ }
+  }, []);
+  React.useEffect(() => {
+    void loadPlan();
+    const timer = window.setInterval(() => void loadPlan(), 3000);
+    return () => window.clearInterval(timer);
+  }, [loadPlan]);
+
+  async function connectPlan(clientID = "") {
+    const tab = window.open("", "_blank");
+    setPlanBusy(true);
+    try {
+      const { authorize_url } = await api.chatGPTPlanStart(clientID);
+      if (tab) tab.location.href = authorize_url;
+      else window.location.href = authorize_url;
+    } catch (e) {
+      tab?.close();
+      toast.error(`ChatGPT sign-in failed: ${(e as Error).message}`);
+    } finally { setPlanBusy(false); }
+  }
+
+  async function signOutPlan() {
+    setPlanBusy(true);
+    try {
+      const result = await api.chatGPTPlanSignOut();
+      await loadPlan();
+      toast.success(result.revocation_confirmed ? "ChatGPT session disconnected" : "Disconnected locally; check ChatGPT Settings to revoke this app");
+    } catch (e) { toast.error(`Sign out failed: ${(e as Error).message}`); }
+    finally { setPlanBusy(false); }
+  }
+
+  async function toggleDaybreak() {
+    setPlanBusy(true);
+    try {
+      await api.chatGPTPlanDaybreak(planStatus.cyber_program ? "" : "daybreak_blue");
+      await loadPlan();
+      toast.success("Daybreak request setting updated. Test the selected model to verify account access.");
+    } catch (e) { toast.error(`Daybreak setting failed: ${(e as Error).message}`); }
+    finally { setPlanBusy(false); }
+  }
 
   const load = React.useCallback(async () => {
     try {
@@ -961,6 +1015,27 @@ export default function LLMPage() {
         </div>
       </div>
 
+      <Card className="gap-2 py-4">
+        <CardContent className="flex flex-wrap items-center justify-between gap-3 px-4">
+          <div>
+            <p className="font-medium text-sm">ChatGPT plan</p>
+            <p className="text-muted-foreground text-xs">{planStatus.connected ? `Connected as ${planStatus.accounts.find((a) => a.active)?.email || "ChatGPT account"}` : "Connect your own account before using a ChatGPT plan profile."}</p>
+            <p className="text-muted-foreground text-xs">Daybreak requires separate approval. The model test will show whether this account and route can use it.</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {planStatus.accounts.filter((a) => !a.active).map((a) => (
+              <Button key={a.client_id} size="sm" variant="outline" disabled={planBusy} onClick={async () => { await api.chatGPTPlanSelect(a.client_id); await loadPlan(); }}>
+                Use {a.email || "saved account"}
+              </Button>
+            ))}
+            <Button size="sm" variant="outline" disabled={planBusy} onClick={() => void connectPlan(planStatus.accounts.find((a) => a.active)?.client_id || "")}>Continue with ChatGPT</Button>
+            {planStatus.accounts.length > 0 && <Button size="sm" variant="outline" disabled={planBusy} onClick={() => void connectPlan()}>Add account</Button>}
+            {planStatus.accounts.some((a) => a.active) && <Button size="sm" variant="outline" disabled={planBusy} onClick={() => void signOutPlan()}>Sign out</Button>}
+            {planStatus.connected && <Button size="sm" variant="outline" disabled={planBusy} onClick={() => void toggleDaybreak()}>{planStatus.cyber_program ? "Daybreak Blue on" : "Request Daybreak Blue"}</Button>}
+          </div>
+        </CardContent>
+      </Card>
+
       <Tabs defaultValue="profiles" className="flex-1">
         <TabsList>
           <TabsTrigger value="profiles">Model profiles</TabsTrigger>
@@ -970,7 +1045,7 @@ export default function LLMPage() {
         <TabsContent value="profiles" className="mt-4">
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
             {profiles.map((p) => {
-              const h = healthOf(p, health.get(p.id));
+              const h = healthOf(p, health.get(p.id), planStatus.connected);
               return (
                 // biome-ignore lint/a11y/useSemanticElements: the card contains its own action buttons; a native <button> would nest buttons (invalid HTML)
                 <Card

@@ -1079,6 +1079,11 @@ export const api = {
       proxy,
       profile_id,
     }),
+  chatGPTPlanStatus: () => get<{ connected: boolean; cyber_program: string; accounts: { client_id: string; email: string; active: boolean; connected: boolean }[] }>("/siwc/status"),
+  chatGPTPlanStart: (client_id = "") => post<{ authorize_url: string }>("/siwc/start", { client_id }),
+  chatGPTPlanSelect: (client_id: string) => post<{ connected: boolean }>("/siwc/select", { client_id }),
+  chatGPTPlanSignOut: () => post<{ connected: boolean; revocation_confirmed: boolean }>("/siwc/signout", {}),
+  chatGPTPlanDaybreak: (cyber_program: string) => post<{ cyber_program: string }>("/siwc/daybreak", { cyber_program }),
 
   // ---- agents ----
   agents: () => get<{ agents: Agent[] }>("/agents").then((r) => arr(r.agents)),

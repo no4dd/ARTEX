@@ -12,8 +12,10 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"iter"
 	"log"
 	"net/http"
 	"net/url"
@@ -35,7 +37,11 @@ type Config struct {
 	Format  llm.Format
 	BaseURL string
 	APIKey  string
-	Model   string
+	// TokenSource supplies a short-lived ChatGPT plan OAuth access token. It is
+	// installed by the local ARTEX server and never serialized in an LLM profile.
+	TokenSource func(context.Context) (string, error)
+	PlanCyber   string // optional Daybreak selection for a ChatGPT plan profile
+	Model       string
 	// Proxy routes all LLM requests through the given proxy URL (http/https/socks5,
 	// optionally with user:pass@ credentials). Empty means direct — it does NOT
 	// fall back to the standard *_PROXY environment variables.
@@ -140,6 +146,7 @@ const (
 // forcing our base-URL/key defaults so an empty key never falls back to
 // OpenAI's public endpoint).
 const FormatOllama llm.Format = "ollama"
+const FormatChatGPTPlan llm.Format = "chatgpt-plan"
 
 // DefaultOllamaBaseURL is the base of Ollama's OpenAI-compatible endpoint the
 // provider appends /chat/completions to. Must never end up empty: with an
@@ -171,7 +178,7 @@ func normalizeOllamaBaseURL(raw string) string {
 
 // NeedsAPIKey reports whether this provider format requires an API key to be
 // usable. Ollama (local server) is keyless; every cloud format needs one.
-func (c Config) NeedsAPIKey() bool { return c.Format != FormatOllama }
+func (c Config) NeedsAPIKey() bool { return c.Format != FormatOllama && c.Format != FormatChatGPTPlan }
 
 // CompactionWindow returns the model context window in TOKENS for compaction
 // thresholds, resolved from the user-configured size (ContextWindowK). 0/unset →
@@ -261,6 +268,14 @@ func FromEnv() (Config, bool) {
 		c.APIKey = oaiKey
 		if c.Model == "" {
 			c.Model = "gpt-5"
+		}
+	case "chatgpt-plan":
+		c.Format = FormatChatGPTPlan
+		c.BaseURL = "https://api.openai.com/v1"
+		c.APIKey = ""
+		c.Proxy = ""
+		if c.Model == "" {
+			c.Model = "gpt-6-sol"
 		}
 	case "ollama":
 		c.Format = FormatOllama
@@ -354,6 +369,8 @@ func (c Config) Provider() string {
 		return "openai-responses"
 	case FormatOllama:
 		return "ollama"
+	case FormatChatGPTPlan:
+		return "chatgpt-plan"
 	}
 	return "anthropic"
 }
@@ -362,6 +379,9 @@ func (c Config) Provider() string {
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
 func (c Config) NewProvider() (llm.Provider, error) {
+	if c.Format == FormatChatGPTPlan && c.TokenSource == nil {
+		return nil, fmt.Errorf("connect a ChatGPT plan in ARTEX settings")
+	}
 	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.UserAgent)
 	if err != nil {
 		return nil, err
@@ -382,6 +402,13 @@ func (c Config) NewProvider() (llm.Provider, error) {
 		if strings.TrimSpace(apiKey) == "" {
 			apiKey = ollamaPlaceholderKey
 		}
+	}
+	if wireFormat == FormatChatGPTPlan {
+		wireFormat = llm.FormatOpenAIResponses
+		baseURL = "https://api.openai.com/v1"
+		apiKey = "chatgpt-plan-token-is-injected-per-request"
+		client.Transport = planTransport{base: client.Transport, token: c.TokenSource, cyber: c.PlanCyber}
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	}
 	lc := llm.Config{
 		Format:     wireFormat,
@@ -408,7 +435,104 @@ func (c Config) NewProvider() (llm.Provider, error) {
 	if c.RatePerSecond > 0 || c.RatePerMinute > 0 {
 		lc.RateLimit = &llm.RateLimit{PerSecond: c.RatePerSecond, PerMinute: c.RatePerMinute}
 	}
-	return llm.NewProvider(lc)
+	p, err := llm.NewProvider(lc)
+	if err != nil {
+		return nil, err
+	}
+	if c.Format == FormatChatGPTPlan {
+		return planProvider{Provider: p}, nil
+	}
+	return p, nil
+}
+
+// planTransport pins the destination and converts Norma's generic Responses
+// request into the documented ChatGPT plan subset before any bytes leave ARTEX.
+type planTransport struct {
+	base  http.RoundTripper
+	token func(context.Context) (string, error)
+	cyber string
+}
+
+func (t planTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme != "https" || req.URL.Host != "api.openai.com" || req.URL.Path != "/v1/responses" || req.Method != http.MethodPost {
+		return nil, fmt.Errorf("ChatGPT plan request destination is not the public Responses API")
+	}
+	b, err := io.ReadAll(io.LimitReader(req.Body, 32<<20))
+	if err != nil {
+		return nil, err
+	}
+	var body map[string]any
+	if err := json.Unmarshal(b, &body); err != nil {
+		return nil, err
+	}
+	delete(body, "max_output_tokens")
+	delete(body, "temperature")
+	body["store"] = false
+	body["stream"] = true
+	if t.cyber != "" {
+		body["access_programs"] = map[string]string{"cyber": t.cyber}
+	}
+	if raw, ok := body["tools"].([]any); ok && len(raw) > 0 {
+		body["tools"] = []any{map[string]any{"type": "namespace", "name": "artex", "description": "ARTEX local security testing tools", "tools": raw}}
+	}
+	if input, ok := body["input"].([]any); ok {
+		for _, item := range input {
+			if m, ok := item.(map[string]any); ok && (m["type"] == "function_call" || m["type"] == "function_call_output") {
+				m["namespace"] = "artex"
+			}
+		}
+	}
+	b, err = json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	token, err := t.token(req.Context())
+	if err != nil {
+		return nil, err
+	}
+	cloned := req.Clone(req.Context())
+	cloned.Body = io.NopCloser(bytes.NewReader(b))
+	cloned.ContentLength = int64(len(b))
+	cloned.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
+	cloned.Header.Set("Authorization", "Bearer "+token)
+	return t.base.RoundTrip(cloned)
+}
+
+type planProvider struct{ llm.Provider }
+
+func (p planProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return func(yield func(llm.StreamEvent, error) bool) {
+		complete := false
+		for ev, err := range p.Provider.Stream(ctx, req) {
+			if err != nil {
+				yield(ev, err)
+				return
+			}
+			if ev.Type == llm.SEMessageDelta {
+				if ev.StopReason == "max_tokens" {
+					yield(llm.StreamEvent{}, fmt.Errorf("ChatGPT response was incomplete"))
+					return
+				}
+				complete = true
+			}
+			if !yield(ev, nil) {
+				return
+			}
+		}
+		if !complete {
+			yield(llm.StreamEvent{}, fmt.Errorf("ChatGPT response stream ended before completion"))
+		}
+	}
+}
+func (p planProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	a := llm.NewAccumulator()
+	for ev, err := range p.Stream(ctx, req) {
+		if err != nil {
+			return llm.Message{}, "", llm.Usage{}, err
+		}
+		a.Add(ev)
+	}
+	return a.Message(), a.StopReason, a.Usage, nil
 }
 
 // IsQuotaExhaustedMessage deliberately recognizes only explicit balance,

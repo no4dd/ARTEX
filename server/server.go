@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -29,6 +30,7 @@ import (
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
+	"github.com/Autumn-27/artex/siwc"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
@@ -47,8 +49,9 @@ type Server struct {
 	engine *Engine
 	ctx    context.Context
 
-	skillDir string // root directory for skill subdirectories
-	jwtKey   []byte // HS256 signing key loaded from / generated into keyDir/jwt.key
+	skillDir string      // root directory for skill subdirectories
+	siwc     *siwc.Store // protected local ChatGPT plan credentials
+	jwtKey   []byte      // HS256 signing key loaded from / generated into keyDir/jwt.key
 
 	scrubSecrets bool // drop ARTEX_PG_DSN and the API keys from the environment once read (binary only)
 
@@ -176,7 +179,12 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
+	planStore, err := siwc.New(keyDir)
+	if err != nil {
+		log.Fatalf("[auth] ChatGPT plan store: %v", err)
+	}
 	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, jwtKey: key, chatBusy: map[string]bool{},
+		siwc:       planStore,
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
@@ -403,6 +411,13 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 		return agent.Config{}, false
 	}
 	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
+	if cfg.Format == agent.FormatChatGPTPlan {
+		cfg.TokenSource = s.siwc.AccessToken
+		cfg.PlanCyber = s.siwc.CyberProgram()
+		if !s.siwc.Connected() {
+			return cfg, false
+		}
+	}
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
 	cfg.ContextWindowK = p.ContextWindowK
 	cfg.ThinkingType = p.ThinkingType
@@ -471,6 +486,13 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 func (s *Server) reapplyActiveProfile() {
 	cfg, ok := s.loadLLMConfig()
 	if !ok {
+		s.cfgMu.Lock()
+		s.llmOn = false
+		s.llmProv = nil
+		s.llmDirect = nil
+		s.chatAgent = nil
+		s.cfgMu.Unlock()
+		s.invalidateTaskAgents()
 		return
 	}
 	if err := s.applyLLM(cfg); err != nil {
@@ -512,9 +534,14 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	// A persisted active profile must use the same cached provider as task chains
 	// and Agent bindings, otherwise each path owns a separate rate limiter.
 	if active, _ := s.m.pg.ActiveProfile(); active != nil {
-		if activeCfg, ok := s.loadProfileConfig(active.ID); ok && activeCfg == cfg {
-			prov, _, _ = s.providerForProfile(active.ID)
-			healthID = active.ID
+		if activeCfg, ok := s.loadProfileConfig(active.ID); ok {
+			activeCfg.TokenSource = nil
+			compareCfg := cfg
+			compareCfg.TokenSource = nil
+			if reflect.DeepEqual(activeCfg, compareCfg) {
+				prov, _, _ = s.providerForProfile(active.ID)
+				healthID = active.ID
+			}
 		}
 	}
 	if prov == nil {
@@ -582,6 +609,13 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 		return agent.Config{}, false
 	}
 	cfg := agent.ConfigFrom(p.Format, p.Model, p.BaseURL, p.APIKey, p.Proxy)
+	if cfg.Format == agent.FormatChatGPTPlan {
+		cfg.TokenSource = s.siwc.AccessToken
+		cfg.PlanCyber = s.siwc.CyberProgram()
+		if !s.siwc.Connected() {
+			return cfg, false
+		}
+	}
 	cfg.RatePerSecond, cfg.RatePerMinute = p.RatePerSecond, p.RatePerMinute
 	cfg.ContextWindowK = p.ContextWindowK
 	cfg.ThinkingType = p.ThinkingType
@@ -739,6 +773,12 @@ func (s *Server) Handler() http.Handler {
 
 	// Auth routes — exempt from JWT check (handled in requireAuth)
 	mux.HandleFunc("GET /api/auth/status", s.authStatus)
+	mux.HandleFunc("GET /api/auth/siwc/callback", s.siwcCallback)
+	mux.HandleFunc("GET /api/siwc/status", s.siwcStatus)
+	mux.HandleFunc("POST /api/siwc/start", s.siwcStart)
+	mux.HandleFunc("POST /api/siwc/select", s.siwcSelect)
+	mux.HandleFunc("POST /api/siwc/signout", s.siwcSignOut)
+	mux.HandleFunc("POST /api/siwc/daybreak", s.siwcDaybreak)
 	mux.HandleFunc("POST /api/auth/init", s.authInit)
 	mux.HandleFunc("POST /api/auth/login", s.authLogin)
 	mux.HandleFunc("POST /api/auth/change-password", s.authChangePassword)
@@ -1458,6 +1498,10 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		s.cfgMu.Unlock()
 	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	if cfg.Format == agent.FormatChatGPTPlan {
+		cfg.TokenSource = s.siwc.AccessToken
+		cfg.PlanCyber = s.siwc.CyberProgram()
+	}
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
@@ -1562,6 +1606,10 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+	if cfg.Format == agent.FormatChatGPTPlan {
+		cfg.TokenSource = s.siwc.AccessToken
+		cfg.PlanCyber = s.siwc.CyberProgram()
+	}
 	// mirror production: send the SAME thinking params so a provider that rejects the
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
 	cfg.ThinkingType = req.ThinkingType

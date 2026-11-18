@@ -18,6 +18,8 @@ and every finding stays bound to the assets and HTTP traffic that prove it.
 
 [Quick start](#quick-start) · [Screenshots](#screenshots) · [How it works](#how-it-works) · [Install](#installation) · [Configuration](#configuration) · [Security](SECURITY.md)
 
+This fork adds [Sign in with ChatGPT plan usage and a Daybreak request setting](docs/CHATGPT_PLAN.md).
+
 </div>
 
 ---

@@ -2055,6 +2055,26 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	p := body.LLMProfile
 	p.APIKey = body.APIKey
 	p.Streaming = body.Streaming == nil || *body.Streaming
+	if p.Format == "chatgpt-plan" {
+		if p.APIKey != "" || p.BaseURL != "" || p.Proxy != "" {
+			writeErr(w, 400, "ChatGPT plan profiles cannot set an API key, base URL, or proxy")
+			return
+		}
+		if p.ID != 0 {
+			old, err := pg.ProfileByID(p.ID)
+			if err != nil || old == nil {
+				writeErr(w, 400, "profile not found")
+				return
+			}
+			if old.Format != "chatgpt-plan" {
+				writeErr(w, 400, "create a new ChatGPT plan profile instead of converting an API key profile")
+				return
+			}
+		}
+		p.Streaming = true
+		p.MaxTokens = 0
+		p.ThinkingType = ""
+	}
 	// The list returns the proxy masked: the placeholder sent back keeps the
 	// stored proxy and is never stored itself.
 	if isMaskedSecret(p.Proxy) {
@@ -2251,6 +2271,15 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
+		return
+	}
+	if req.Provider == "chatgpt-plan" {
+		models, err := s.siwc.Models(r.Context())
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "models": models})
 		return
 	}
 	// Resolve API key: form input > profile stored key. The stored key is only
