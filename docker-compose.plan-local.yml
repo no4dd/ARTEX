@@ -1,0 +1,20 @@
+services:
+  artex:
+    build:
+      context: .
+      dockerfile: Dockerfile.plan-local
+    image: artex:plan-local
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      ARTEX_UPDATE_CHECK: "0"
+      ARTEX_NOISE_PROFILE: quiet
+      ARTEX_TASK_BUDGET_TOKENS: "70000"
+      ARTEX_INTENT_BUDGET_TOKENS: "50000"
+    volumes:
+      - ./skills:/app/skills:ro
